@@ -13,7 +13,6 @@ rkllm-api
 
 # Go workspace
 go.work
-go.sum
 
 # IDE
 .vscode/

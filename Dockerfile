@@ -1,7 +1,7 @@
 # Multi-stage Dockerfile for RKLLM Go API
 # Stage 1: Builder - downloads RKLLM runtime and builds the Go application
 
-FROM --platform=linux/arm64 golang:1.22-bookworm AS builder
+FROM golang:1.22-bookworm AS builder
 
 # Install required build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -16,7 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 
 # Copy Go module files
-COPY go.mod go.sum ./
+COPY go.mod ./
+COPY go.su[m] ./
 RUN go mod download
 
 # Download RKLLM runtime from GitHub
@@ -45,7 +46,7 @@ RUN go build -o rkllm-api .
 
 # Stage 2: Runtime
 # Use minimal Debian base for smaller image size
-FROM --platform=linux/arm64 debian:bookworm-slim
+FROM debian:bookworm-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -78,7 +79,7 @@ EXPOSE 8080
 
 # Set environment variables
 ENV GIN_MODE=release
-ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/usr/local/lib
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
