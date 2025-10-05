@@ -1,9 +1,6 @@
 [
     {
-        "name": "filesystem",
-        "url": "http://mcp-filesystem:8000/mcp",
-        "headers": {
-            "Authorization": "Bearer your-token-here"
-        }
+        "name": "media",
+        "url": "https://mcparr.atanasovski.xyz"
     }
 ]

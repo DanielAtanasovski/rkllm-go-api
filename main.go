@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
 	"os/signal"
 	"strings"
@@ -41,7 +42,7 @@ type MCPRequest struct {
 
 type MCPResponse struct {
 	Jsonrpc string      `json:"jsonrpc"`
-	ID      int         `json:"id"`
+	ID      interface{} `json:"id"` // Can be int or string
 	Result  interface{} `json:"result,omitempty"`
 	Error   interface{} `json:"error,omitempty"`
 }
@@ -58,10 +59,12 @@ var (
 	streamMutex   sync.Mutex
 	isStreaming   bool
 	// MCP and system prompt
-	mcpServers    []MCPServer
-	mcpMutex      sync.RWMutex
-	systemPrompt  string
-	promptMutex   sync.RWMutex
+	mcpServers      []MCPServer
+	mcpMutex        sync.RWMutex
+	systemPrompt    string
+	plannerPrompt   string
+	finalizerPrompt string
+	promptMutex     sync.RWMutex
 )
 
 // InitRequest represents the request body for initializing the LLM
@@ -108,20 +111,57 @@ type HealthResponse struct {
 
 // Load system prompt from file
 func loadSystemPrompt() {
-	promptPath := os.Getenv("SYSTEM_PROMPT_PATH")
-	if promptPath == "" {
-		promptPath = "/app/system_prompt.txt"
+	// Load system prompt
+	systemPromptPath := os.Getenv("SYSTEM_PROMPT_PATH")
+	if systemPromptPath == "" {
+		systemPromptPath = "/app/system_prompt.txt"
 	}
 
-	if content, err := os.ReadFile(promptPath); err == nil {
+	if content, err := os.ReadFile(systemPromptPath); err == nil {
 		promptMutex.Lock()
 		systemPrompt = strings.TrimSpace(string(content))
 		promptMutex.Unlock()
-		log.Printf("Loaded system prompt from %s (%d characters)", promptPath, len(systemPrompt))
+		log.Printf("Loaded system prompt from %s (%d characters)", systemPromptPath, len(systemPrompt))
 	} else {
-		log.Printf("No system prompt file found at %s, using default", promptPath)
+		log.Printf("No system prompt file found at %s, using default", systemPromptPath)
 		promptMutex.Lock()
 		systemPrompt = "You are a helpful AI assistant."
+		promptMutex.Unlock()
+	}
+
+	// Load planner prompt
+	plannerPromptPath := os.Getenv("PLANNER_PROMPT_PATH")
+	if plannerPromptPath == "" {
+		plannerPromptPath = "/app/planner_prompt.txt"
+	}
+
+	if content, err := os.ReadFile(plannerPromptPath); err == nil {
+		promptMutex.Lock()
+		plannerPrompt = strings.TrimSpace(string(content))
+		promptMutex.Unlock()
+		log.Printf("Loaded planner prompt from %s (%d characters)", plannerPromptPath, len(plannerPrompt))
+	} else {
+		log.Printf("No planner prompt file found at %s, using default", plannerPromptPath)
+		promptMutex.Lock()
+		plannerPrompt = "You are a planner."
+		promptMutex.Unlock()
+	}
+
+	// Load finalizer prompt
+	finalizerPromptPath := os.Getenv("FINALIZER_PROMPT_PATH")
+	if finalizerPromptPath == "" {
+		finalizerPromptPath = "/app/finalizer_prompt.txt"
+	}
+
+	if content, err := os.ReadFile(finalizerPromptPath); err == nil {
+		promptMutex.Lock()
+		finalizerPrompt = strings.TrimSpace(string(content))
+		promptMutex.Unlock()
+		log.Printf("Loaded finalizer prompt from %s (%d characters)", finalizerPromptPath, len(finalizerPrompt))
+	} else {
+		log.Printf("No finalizer prompt file found at %s, using default", finalizerPromptPath)
+		promptMutex.Lock()
+		finalizerPrompt = "Provide a helpful response."
 		promptMutex.Unlock()
 	}
 }
@@ -142,8 +182,8 @@ func loadMCPServers() {
 			log.Printf("Loaded %d MCP servers from %s", len(servers), mcpPath)
 
 			// Discover tools from each server
-			for i := range mcpServers {
-				discoverMCPTools(&mcpServers[i])
+			for i := range servers {
+				discoverMCPTools(&servers[i])
 			}
 		} else {
 			log.Printf("Failed to parse MCP servers config: %v", err)
@@ -153,26 +193,153 @@ func loadMCPServers() {
 	}
 }
 
-// Discover tools from an MCP server
+// Discover tools from an MCP server with proper lifecycle
 func discoverMCPTools(server *MCPServer) {
-	req := MCPRequest{
+	log.Printf("Starting MCP tool discovery for server: %s at %s", server.Name, server.URL)
+
+	// Create HTTP client with cookie jar to maintain session
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Jar:     jar,
+	}
+	baseURL := server.URL + "/mcp"
+
+	// Step 1: Initialize the MCP session
+	initReq := MCPRequest{
 		Jsonrpc: "2.0",
 		ID:      1,
+		Method:  "initialize",
+		Params: map[string]interface{}{
+			"protocolVersion": "2024-11-05",
+			"capabilities": map[string]interface{}{
+				"roots": map[string]interface{}{
+					"listChanged": true,
+				},
+			},
+			"clientInfo": map[string]interface{}{
+				"name":    "RKLLM-Go-API",
+				"version": "1.0.0",
+			},
+		},
+	}
+
+	sessionID, success := sendMCPRequestWithSession(client, baseURL, server, initReq, "initialize", "")
+	if !success {
+		return
+	}
+
+	// Step 2: Send initialized notification
+	initNotification := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "notifications/initialized",
+	}
+
+	if !sendMCPNotificationWithSession(client, baseURL, server, initNotification, sessionID) {
+		return
+	}
+
+	// Step 3: Now we can list tools
+	toolsReq := MCPRequest{
+		Jsonrpc: "2.0",
+		ID:      2,
 		Method:  "tools/list",
 		Params:  map[string]interface{}{},
 	}
 
-	reqBody, _ := json.Marshal(req)
-	resp, err := http.Post(server.URL, "application/json", bytes.NewBuffer(reqBody))
-	if err != nil {
-		log.Printf("Failed to discover tools from %s: %v", server.Name, err)
+	if _, success := sendMCPRequestWithSession(client, baseURL, server, toolsReq, "tools/list", sessionID); !success {
 		return
+	}
+}
+
+// Helper function to send MCP requests and handle responses with session management
+func sendMCPRequestWithSession(client *http.Client, baseURL string, server *MCPServer, req MCPRequest, requestType string, sessionID string) (string, bool) {
+	return sendMCPRequestWithSessionAndResult(client, baseURL, server, req, requestType, sessionID, nil)
+}
+
+// Extended version that can capture tool call results
+func sendMCPRequestWithSessionAndResult(client *http.Client, baseURL string, server *MCPServer, req MCPRequest, requestType string, sessionID string, resultPtr *interface{}) (string, bool) {
+	reqBody, _ := json.Marshal(req)
+
+	httpReq, err := http.NewRequest("POST", baseURL, bytes.NewBuffer(reqBody))
+	if err != nil {
+		log.Printf("Failed to create %s request for %s: %v", requestType, server.Name, err)
+		return "", false
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json, text/event-stream")
+	httpReq.Header.Set("MCP-Protocol-Version", "2024-11-05")
+
+	// Add session ID if provided
+	if sessionID != "" {
+		httpReq.Header.Set("mcp-session-id", sessionID)
+	}
+
+	// Add custom headers if provided
+	for k, v := range server.Headers {
+		httpReq.Header.Set(k, v)
+	}
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		log.Printf("Failed to send %s request to %s: %v", requestType, server.Name, err)
+		return "", false
 	}
 	defer resp.Body.Close()
 
+	log.Printf("MCP %s response from %s: status=%d", requestType, server.Name, resp.StatusCode)
+
+	// Extract session ID from response headers (for initialize requests)
+	newSessionID := resp.Header.Get("mcp-session-id")
+	if requestType == "initialize" && newSessionID != "" {
+		log.Printf("Received session ID from %s: %s", server.Name, newSessionID)
+	}
+
 	body, _ := io.ReadAll(resp.Body)
+
+	// Handle SSE response format from FastMCP
 	var mcpResp MCPResponse
-	if err := json.Unmarshal(body, &mcpResp); err == nil {
+	bodyStr := string(body)
+
+	// Check if it's SSE format
+	if strings.HasPrefix(bodyStr, "event:") {
+		// Parse SSE format: extract JSON from "data: {...}" line
+		lines := strings.Split(bodyStr, "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "data: ") {
+				jsonData := strings.TrimPrefix(line, "data: ")
+				if err := json.Unmarshal([]byte(jsonData), &mcpResp); err != nil {
+					log.Printf("Failed to parse SSE JSON from %s: %v", server.Name, err)
+					return "", false
+				}
+				break
+			}
+		}
+	} else {
+		// Standard JSON response
+		if err := json.Unmarshal(body, &mcpResp); err != nil {
+			log.Printf("Failed to parse JSON from %s: %v", server.Name, err)
+			return "", false
+		}
+	}
+
+	// Check for errors
+	if mcpResp.Error != nil {
+		log.Printf("MCP %s error from %s: %v", requestType, server.Name, mcpResp.Error)
+		return newSessionID, false
+	}
+
+	// Also check HTTP status for 400+ errors
+	if resp.StatusCode >= 400 {
+		log.Printf("MCP %s HTTP error from %s: status=%d, body=%s", requestType, server.Name, resp.StatusCode, bodyStr)
+		return newSessionID, false
+	}
+
+	log.Printf("MCP %s response from %s parsed successfully", requestType, server.Name)
+
+	// Special handling for tools/list response
+	if requestType == "tools/list" {
 		if toolsData, ok := mcpResp.Result.(map[string]interface{}); ok {
 			if tools, ok := toolsData["tools"].([]interface{}); ok {
 				server.Tools = []MCPTool{}
@@ -190,6 +357,48 @@ func discoverMCPTools(server *MCPServer) {
 			}
 		}
 	}
+
+	// Capture result if pointer provided (for tool calls)
+	if resultPtr != nil && mcpResp.Result != nil {
+		*resultPtr = mcpResp.Result
+	}
+
+	return newSessionID, true
+}
+
+// Helper function to send MCP notifications (no response expected)
+func sendMCPNotificationWithSession(client *http.Client, baseURL string, server *MCPServer, notification map[string]interface{}, sessionID string) bool {
+	reqBody, _ := json.Marshal(notification)
+
+	httpReq, err := http.NewRequest("POST", baseURL, bytes.NewBuffer(reqBody))
+	if err != nil {
+		log.Printf("Failed to create initialized notification for %s: %v", server.Name, err)
+		return false
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json, text/event-stream")
+	httpReq.Header.Set("MCP-Protocol-Version", "2024-11-05")
+
+	// Add session ID
+	if sessionID != "" {
+		httpReq.Header.Set("mcp-session-id", sessionID)
+	}
+
+	// Add custom headers if provided
+	for k, v := range server.Headers {
+		httpReq.Header.Set(k, v)
+	}
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		log.Printf("Failed to send initialized notification to %s: %v", server.Name, err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	log.Printf("MCP initialized notification sent to %s: status=%d", server.Name, resp.StatusCode)
+	return true
 }
 
 // Helper functions for type assertions
@@ -207,7 +416,7 @@ func getMap(m map[string]interface{}, key string) map[string]interface{} {
 	return nil
 }
 
-// Call an MCP tool
+// Call an MCP tool with proper session management for FastMCP
 func callMCPTool(serverName, toolName string, params map[string]interface{}) (interface{}, error) {
 	mcpMutex.RLock()
 	var server *MCPServer
@@ -223,9 +432,52 @@ func callMCPTool(serverName, toolName string, params map[string]interface{}) (in
 		return nil, fmt.Errorf("MCP server %s not found", serverName)
 	}
 
-	req := MCPRequest{
+	// Create a new session for this tool call (FastMCP requirement)
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Jar:     jar,
+	}
+	baseURL := server.URL + "/mcp"
+
+	// Step 1: Initialize session
+	initReq := MCPRequest{
 		Jsonrpc: "2.0",
-		ID:      2,
+		ID:      1,
+		Method:  "initialize",
+		Params: map[string]interface{}{
+			"protocolVersion": "2024-11-05",
+			"capabilities": map[string]interface{}{
+				"roots": map[string]interface{}{
+					"listChanged": true,
+				},
+			},
+			"clientInfo": map[string]interface{}{
+				"name":    "RKLLM-Go-API-ToolCall",
+				"version": "1.0.0",
+			},
+		},
+	}
+
+	sessionID, success := sendMCPRequestWithSession(client, baseURL, server, initReq, "initialize", "")
+	if !success {
+		return nil, fmt.Errorf("failed to initialize MCP session for tool call")
+	}
+
+	// Step 2: Send initialized notification
+	initNotification := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "notifications/initialized",
+	}
+
+	if !sendMCPNotificationWithSession(client, baseURL, server, initNotification, sessionID) {
+		return nil, fmt.Errorf("failed to send initialized notification for tool call")
+	}
+
+	// Step 3: Call the tool
+	toolReq := MCPRequest{
+		Jsonrpc: "2.0",
+		ID:      3,
 		Method:  "tools/call",
 		Params: map[string]interface{}{
 			"name":      toolName,
@@ -233,33 +485,439 @@ func callMCPTool(serverName, toolName string, params map[string]interface{}) (in
 		},
 	}
 
-	reqBody, _ := json.Marshal(req)
-	httpReq, _ := http.NewRequest("POST", server.URL, bytes.NewBuffer(reqBody))
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	// Add custom headers
-	for k, v := range server.Headers {
-		httpReq.Header.Set(k, v)
+	var toolResult interface{}
+	_, success = sendMCPRequestWithSessionAndResult(client, baseURL, server, toolReq, "tools/call", sessionID, &toolResult)
+	if !success {
+		return nil, fmt.Errorf("tool call failed")
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(httpReq)
+	return toolResult, nil
+}
+
+// Handle tool result interpretation by having the AI respond conversationally
+func handleToolResultInterpretation(toolCall struct {
+	Tool   string                 `json:"tool"`
+	Server string                 `json:"server"`
+	Params map[string]interface{} `json:"params"`
+}, result interface{}) (string, bool) {
+	// Create a follow-up prompt for the AI to interpret the tool results
+	resultJSON, _ := json.MarshalIndent(result, "", "  ")
+
+	interpretationPrompt := fmt.Sprintf(`You just called the tool "%s" with parameters %v and received these results:
+
+%s
+
+Now respond to the user in a helpful, conversational way. Summarize what you found and offer next steps if appropriate. Do not show raw JSON - interpret and explain the results naturally.`,
+		toolCall.Tool,
+		toolCall.Params,
+		string(resultJSON))
+
+	// Build the interpretation prompt with system context
+	fullPrompt := buildEnhancedPrompt(interpretationPrompt)
+
+	// Run inference to get conversational response
+	input := rkllm.Input{
+		Role:        "",
+		InputType:   rkllm.InputTypePrompt,
+		PromptInput: fullPrompt,
+	}
+
+	inferParam := rkllm.InferParam{
+		Mode:        rkllm.InferModeGenerate,
+		KeepHistory: 0, // Don't keep history for tool interpretation
+	}
+
+	// Temporarily store current result and run interpretation
+	resultMutex.Lock()
+	originalResult := currentResult
+	currentResult = ""
+	resultMutex.Unlock()
+
+	err := llmHandle.Run(input, inferParam)
 	if err != nil {
+		log.Printf("Tool result interpretation failed: %v", err)
+		// Restore original result and return raw data as fallback
+		resultMutex.Lock()
+		currentResult = originalResult
+		resultMutex.Unlock()
+		return fmt.Sprintf("Tool call completed but interpretation failed. Raw result:\n```json\n%s\n```", string(resultJSON)), true
+	}
+
+	// Get the interpretation result
+	resultMutex.Lock()
+	interpretation := currentResult
+	currentResult = originalResult // Restore original for any further processing
+	resultMutex.Unlock()
+
+	return interpretation, true
+}
+
+// Run represents a multi-step agent execution
+type Run struct {
+	ID          string       `json:"id"`
+	UserQuery   string       `json:"user_query"`
+	Scratchpad  []string     `json:"scratchpad"`
+	ToolResults []ToolResult `json:"tool_results"`
+	Status      string       `json:"status"`
+	Facts       []string     `json:"facts"`
+}
+
+// ToolCall represents a planned tool execution
+type ToolCall struct {
+	Name   string                 `json:"name"`
+	Args   map[string]interface{} `json:"args"`
+	CallID string                 `json:"call_id"`
+}
+
+// ToolResult represents the result of a tool execution
+type ToolResult struct {
+	CallID string      `json:"call_id"`
+	Name   string      `json:"name"`
+	OK     bool        `json:"ok"`
+	Data   interface{} `json:"data,omitempty"`
+	Error  string      `json:"error,omitempty"`
+}
+
+// PlannerResponse represents the planner's JSON output
+type PlannerResponse struct {
+	ToolCalls  []ToolCall `json:"tool_calls"`
+	StopReason string     `json:"stop_reason"`
+	Facts      []string   `json:"facts"`
+	Reasoning  string     `json:"reasoning,omitempty"`
+}
+
+// Execute a multi-phase agent run
+func executeAgentRun(userQuery string) (string, error) {
+	run := &Run{
+		ID:          fmt.Sprintf("run_%d", time.Now().Unix()),
+		UserQuery:   userQuery,
+		Scratchpad:  []string{},
+		ToolResults: []ToolResult{},
+		Status:      "planning",
+		Facts:       []string{},
+	}
+
+	maxSteps := 6
+	for step := 1; step <= maxSteps; step++ {
+		log.Printf("Agent Run %s - Step %d: %s", run.ID, step, run.Status)
+
+		// Phase 1: PLAN
+		plan, err := runPlanner(run)
+		if err != nil {
+			return "", fmt.Errorf("planner failed at step %d: %v", step, err)
+		}
+
+		// Update facts from planner
+		run.Facts = append(run.Facts, plan.Facts...)
+
+		// Phase 2: EXECUTE tools if any were planned
+		if len(plan.ToolCalls) > 0 {
+			log.Printf("Agent Run %s - Step %d: executing %d tool calls", run.ID, step, len(plan.ToolCalls))
+			run.Status = "executing"
+			results := executeToolCalls(plan.ToolCalls)
+			run.ToolResults = append(run.ToolResults, results...)
+
+			// Update scratchpad with results
+			for _, result := range results {
+				if result.OK {
+					run.Scratchpad = append(run.Scratchpad,
+						fmt.Sprintf("Tool %s (call_id:%s) succeeded: %v",
+							result.Name, result.CallID, result.Data))
+				} else {
+					run.Scratchpad = append(run.Scratchpad,
+						fmt.Sprintf("Tool %s (call_id:%s) failed: %s",
+							result.Name, result.CallID, result.Error))
+				}
+			}
+			run.Status = "planning" // Continue planning after tool execution
+			// Check if ready to answer after executing tools
+			if plan.StopReason == "ready_to_answer" && len(run.Facts) > 0 {
+				run.Status = "finalizing"
+				break
+			}
+		} else if plan.StopReason == "ready_to_answer" {
+			// No tool calls planned - either trivial query or enough info already
+			log.Printf("Agent Run %s - Step %d: ready to answer without tool calls", run.ID, step)
+			run.Status = "finalizing"
+			break
+		}
+	}
+
+	// Phase 3: FINALIZE
+	finalAnswer, err := runFinalizer(run)
+	if err != nil {
+		return "", fmt.Errorf("finalizer failed: %v", err)
+	}
+
+	return finalAnswer, nil
+}
+
+// Run the planner phase
+func runPlanner(run *Run) (*PlannerResponse, error) {
+	plannerPrompt := buildPlannerPrompt(run)
+
+	// Use low temperature for structured planning
+	input := rkllm.Input{
+		Role:        "",
+		InputType:   rkllm.InputTypePrompt,
+		PromptInput: plannerPrompt,
+	}
+
+	inferParam := rkllm.InferParam{
+		Mode:        rkllm.InferModeGenerate,
+		KeepHistory: 0,
+	}
+
+	// Run planner inference
+	resultMutex.Lock()
+	originalResult := currentResult
+	currentResult = ""
+	resultMutex.Unlock()
+
+	err := llmHandle.Run(input, inferParam)
+	if err != nil {
+		resultMutex.Lock()
+		currentResult = originalResult
+		resultMutex.Unlock()
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	var mcpResp MCPResponse
-	if err := json.Unmarshal(body, &mcpResp); err != nil {
-		return nil, err
+	// Get planner result
+	resultMutex.Lock()
+	plannerOutput := currentResult
+	currentResult = originalResult
+	resultMutex.Unlock()
+
+	// Parse JSON response
+	var plan PlannerResponse
+	// Handle thinking tags if present
+	jsonContent := plannerOutput
+	if strings.Contains(plannerOutput, "</think>") {
+		parts := strings.Split(plannerOutput, "</think>")
+		if len(parts) > 1 {
+			jsonContent = strings.TrimSpace(parts[1])
+		}
 	}
 
-	if mcpResp.Error != nil {
-		return nil, fmt.Errorf("MCP error: %v", mcpResp.Error)
+	log.Printf("Planner JSON response: %s", jsonContent)
+
+	if err := json.Unmarshal([]byte(jsonContent), &plan); err != nil {
+		return nil, fmt.Errorf("failed to parse planner JSON: %v\nOutput: %s", err, plannerOutput)
 	}
 
-	return mcpResp.Result, nil
+	log.Printf("Planner result: %d tool_calls, stop_reason=%s, %d facts",
+		len(plan.ToolCalls), plan.StopReason, len(plan.Facts))
+
+	return &plan, nil
+}
+
+// Execute multiple tool calls
+func executeToolCalls(toolCalls []ToolCall) []ToolResult {
+	var results []ToolResult
+
+	for _, toolCall := range toolCalls {
+		// Map tool names to server names (simplified mapping)
+		serverName := "media" // Default to media server
+
+		log.Printf("Executing tool call: %s.%s with args: %v (call_id: %s)",
+			serverName, toolCall.Name, toolCall.Args, toolCall.CallID)
+
+		result, err := callMCPTool(serverName, toolCall.Name, toolCall.Args)
+		if err != nil {
+			log.Printf("Tool call %s failed: %v", toolCall.CallID, err)
+			results = append(results, ToolResult{
+				CallID: toolCall.CallID,
+				Name:   toolCall.Name,
+				OK:     false,
+				Error:  err.Error(),
+			})
+		} else {
+			resultJSON, _ := json.MarshalIndent(result, "", "  ")
+			log.Printf("Tool call %s succeeded. Result: %s", toolCall.CallID, string(resultJSON))
+			results = append(results, ToolResult{
+				CallID: toolCall.CallID,
+				Name:   toolCall.Name,
+				OK:     true,
+				Data:   result,
+			})
+		}
+	}
+
+	return results
+}
+
+// Run the finalizer phase
+func runFinalizer(run *Run) (string, error) {
+	finalizerPrompt := buildFinalizerPrompt(run)
+
+	// Use higher temperature for creative final response
+	input := rkllm.Input{
+		Role:        "",
+		InputType:   rkllm.InputTypePrompt,
+		PromptInput: finalizerPrompt,
+	}
+
+	inferParam := rkllm.InferParam{
+		Mode:        rkllm.InferModeGenerate,
+		KeepHistory: 0,
+	}
+
+	// Run finalizer inference
+	resultMutex.Lock()
+	originalResult := currentResult
+	currentResult = ""
+	resultMutex.Unlock()
+
+	err := llmHandle.Run(input, inferParam)
+	if err != nil {
+		resultMutex.Lock()
+		currentResult = originalResult
+		resultMutex.Unlock()
+		return "", err
+	}
+
+	// Get finalizer result
+	resultMutex.Lock()
+	finalAnswer := currentResult
+	currentResult = originalResult
+	resultMutex.Unlock()
+
+	return finalAnswer, nil
+}
+
+// Build planner prompt
+func buildPlannerPrompt(run *Run) string {
+	// Get tools list
+	var toolsList []string
+	mcpMutex.RLock()
+	for _, server := range mcpServers {
+		for _, tool := range server.Tools {
+			toolsList = append(toolsList, fmt.Sprintf("- %s: %s", tool.Name, tool.Description))
+		}
+	}
+	mcpMutex.RUnlock()
+	tools := strings.Join(toolsList, "\n")
+
+	// Build scratchpad section
+	var scratchpad string
+	if len(run.Scratchpad) > 0 {
+		scratchpad = "\nPrevious results:\n"
+		for _, entry := range run.Scratchpad {
+			scratchpad += "- " + entry + "\n"
+		}
+	}
+
+	// Replace placeholders in template
+	promptMutex.RLock()
+	prompt := plannerPrompt
+	promptMutex.RUnlock()
+
+	prompt = strings.ReplaceAll(prompt, "{TOOLS}", tools)
+	prompt = strings.ReplaceAll(prompt, "{USER_QUERY}", run.UserQuery)
+	prompt = strings.ReplaceAll(prompt, "{SCRATCHPAD}", scratchpad)
+
+	return prompt
+}
+
+// Extract user query from enhanced prompt
+func extractUserQuery(enhancedPrompt string) string {
+	lines := strings.Split(enhancedPrompt, "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "User: ") {
+			return strings.TrimPrefix(line, "User: ")
+		}
+	}
+	// Fallback - return the last line or the whole prompt
+	if len(lines) > 0 {
+		return lines[len(lines)-1]
+	}
+	return enhancedPrompt
+}
+
+// Build finalizer prompt
+func buildFinalizerPrompt(run *Run) string {
+	// Build facts section
+	var factsSection string
+	if len(run.Facts) > 0 {
+		for i, fact := range run.Facts {
+			factsSection += fmt.Sprintf("%d. %s\n", i+1, fact)
+		}
+	} else {
+		factsSection = "(No specific facts gathered from tools)\n"
+	}
+
+	// Build tool results section
+	var toolResultsSection string
+	if len(run.ToolResults) > 0 {
+		toolResultsSection = "\nTool results:\n"
+		for _, result := range run.ToolResults {
+			if result.OK {
+				resultJSON, _ := json.MarshalIndent(result.Data, "", "  ")
+				toolResultsSection += fmt.Sprintf("- %s: %s\n", result.Name, string(resultJSON))
+			}
+		}
+	}
+
+	// Replace placeholders in template
+	promptMutex.RLock()
+	prompt := finalizerPrompt
+	sysPrompt := systemPrompt
+	promptMutex.RUnlock()
+
+	prompt = strings.ReplaceAll(prompt, "{SYSTEM_PROMPT}", "System: "+sysPrompt)
+	prompt = strings.ReplaceAll(prompt, "{USER_QUERY}", run.UserQuery)
+	prompt = strings.ReplaceAll(prompt, "{FACTS}", factsSection)
+	prompt = strings.ReplaceAll(prompt, "{TOOL_RESULTS}", toolResultsSection)
+
+	return prompt
+}
+
+// Handle tool calls in LLM responses (legacy - now using executeAgentRun)
+func handleToolCall(response string) (string, bool) {
+	// Look for JSON tool calls in the response
+	// Handle both thinking format and direct JSON
+	var jsonContent string
+
+	// Check if response contains thinking tags
+	if strings.Contains(response, "</think>") {
+		// Extract content after thinking
+		parts := strings.Split(response, "</think>")
+		if len(parts) > 1 {
+			jsonContent = strings.TrimSpace(parts[1])
+		}
+	} else {
+		jsonContent = strings.TrimSpace(response)
+	}
+
+	// Try to parse as JSON tool call
+	var toolCall struct {
+		Tool   string                 `json:"tool"`
+		Server string                 `json:"server"`
+		Params map[string]interface{} `json:"params"`
+	}
+
+	if err := json.Unmarshal([]byte(jsonContent), &toolCall); err != nil {
+		// Not a tool call, return original response
+		return response, false
+	}
+
+	// Validate required fields
+	if toolCall.Tool == "" || toolCall.Server == "" {
+		return response, false
+	}
+
+	log.Printf("Executing tool call: %s.%s with params: %v", toolCall.Server, toolCall.Tool, toolCall.Params)
+
+	// Execute the tool call
+	result, err := callMCPTool(toolCall.Server, toolCall.Tool, toolCall.Params)
+	if err != nil {
+		log.Printf("Tool call failed: %v", err)
+		return fmt.Sprintf("Tool call failed: %v", err), true
+	}
+
+	// Instead of returning raw JSON, let the AI interpret the results
+	// We'll re-run the LLM with the tool results to get a conversational response
+	return handleToolResultInterpretation(toolCall, result)
 }
 
 // Build enhanced prompt with system prompt and available tools (always enabled)
@@ -279,11 +937,23 @@ func buildEnhancedPrompt(originalPrompt string) string {
 		parts = append(parts, "\nAvailable Tools:")
 		for _, server := range mcpServers {
 			for _, tool := range server.Tools {
-				toolDesc := fmt.Sprintf("- %s (%s): %s", tool.Name, server.Name, tool.Description)
+				// Extract required parameters from schema
+				var paramInfo string
+				if schema, ok := tool.InputSchema["properties"].(map[string]interface{}); ok {
+					var paramNames []string
+					for paramName := range schema {
+						paramNames = append(paramNames, fmt.Sprintf(`"%s"`, paramName))
+					}
+					if len(paramNames) > 0 {
+						paramInfo = fmt.Sprintf(" [params: %s]", strings.Join(paramNames, ", "))
+					}
+				}
+				toolDesc := fmt.Sprintf("- %s (server: %s)%s: %s", tool.Name, server.Name, paramInfo, tool.Description)
 				parts = append(parts, toolDesc)
 			}
 		}
 		parts = append(parts, "\nTo use a tool, respond with JSON: {\"tool\": \"toolName\", \"server\": \"serverName\", \"params\": {...}}")
+		parts = append(parts, fmt.Sprintf("CRITICAL: The server name is '%s' - do NOT use 'Radarr', 'Sonarr', or any other name!", mcpServers[0].Name))
 	}
 	mcpMutex.RUnlock()
 
@@ -521,51 +1191,31 @@ func chatHandler(c *gin.Context) {
 	currentResult = ""
 	resultMutex.Unlock()
 
-	// Build enhanced prompt with system prompt and MCP tools (always enabled)
-	enhancedPrompt := buildEnhancedPrompt(req.Prompt)
-
-	// Prepare input
-	input := rkllm.Input{
-		Role:           req.Role,
-		EnableThinking: req.EnableThinking,
-		InputType:      rkllm.InputTypePrompt,
-		PromptInput:    enhancedPrompt,
-	}
-
-	inferParam := rkllm.InferParam{
-		Mode:        rkllm.InferModeGenerate,
-		KeepHistory: req.KeepHistory,
-	}
-
 	log.Printf("Running inference for prompt: %s (stream=%v)\n", req.Prompt, req.Stream)
 	startTime := time.Now()
 
 	if req.Stream {
-		// Handle streaming response
-		handleStreamingChat(c, input, inferParam)
+		// Handle streaming with agent architecture
+		handleStreamingChatWithAgent(c, req.Prompt)
 	} else {
-		// Handle non-streaming response (existing behavior)
-		err := llmHandle.Run(input, inferParam)
+		// Use multi-phase agent architecture directly
+		agentResponse, err := executeAgentRun(req.Prompt)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Inference failed: %v", err)})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Agent run failed: %v", err)})
 			return
 		}
 
 		elapsed := time.Since(startTime)
-		log.Printf("Inference completed in %v\n", elapsed)
+		log.Printf("Agent run completed in %v\n", elapsed)
 
-		// Get the accumulated result
-		resultMutex.Lock()
 		response := ChatResponse{
-			Text: currentResult,
+			Text: agentResponse,
 		}
-		resultMutex.Unlock()
-
 		c.JSON(http.StatusOK, response)
 	}
 }
 
-// handleStreamingChat handles Server-Sent Events streaming
+// handleStreamingChat handles Server-Sent Events streaming with tool call support
 func handleStreamingChat(c *gin.Context, input rkllm.Input, inferParam rkllm.InferParam) {
 	// Set up streaming
 	streamMutex.Lock()
@@ -603,22 +1253,140 @@ func handleStreamingChat(c *gin.Context, input rkllm.Input, inferParam rkllm.Inf
 		}
 	}()
 
-	// Stream responses
+	// Buffer to detect tool calls before streaming
+	var responseBuffer strings.Builder
+	var isBuffering = false // Track if we're in buffering mode
+
+	// Stream responses with tool call detection
 	for response := range streamChannel {
 		if response.Error != "" {
 			// Send error event
 			c.SSEvent("error", response)
 			break
 		} else if response.Finished {
-			// Send completion event with performance stats
-			c.SSEvent("done", response)
+			// Check if we need to use agent architecture or legacy tool handling
+			finalText := responseBuffer.String()
+			if looksLikeToolCall(finalText) {
+				// Extract the original user query from the enhanced prompt
+				userQuery := extractUserQuery(input.PromptInput)
+				if agentResponse, err := executeAgentRun(userQuery); err != nil {
+					log.Printf("Streaming agent run failed: %v", err)
+					// Fallback to legacy tool handling
+					if toolCallResponse, executed := handleToolCall(finalText); executed {
+						streamToolInterpretation(c, toolCallResponse)
+					} else {
+						streamToolInterpretation(c, finalText)
+					}
+				} else {
+					// Stream the agent's final response
+					streamToolInterpretation(c, agentResponse)
+				}
+			} else {
+				// Send the final buffered response (if we were buffering) or final event
+				if isBuffering {
+					c.SSEvent("done", &ChatResponse{
+						Text:      finalText,
+						Finished:  true,
+						PerfStats: response.PerfStats,
+					})
+				} else {
+					c.SSEvent("done", response)
+				}
+			}
 			break
 		} else {
-			// Send delta event
-			c.SSEvent("delta", response)
+			// Always buffer the delta
+			responseBuffer.WriteString(response.Delta)
+			bufferedText := responseBuffer.String()
+
+			// Check if we should start/continue buffering
+			if looksLikeToolCall(bufferedText) {
+				isBuffering = true
+				// Don't stream anything - keep buffering
+			} else if !isBuffering {
+				// Stream normally if we haven't started buffering yet
+				c.SSEvent("delta", response)
+				c.Writer.Flush()
+			}
+			// If isBuffering is true but doesn't look like tool call anymore,
+			// we still keep buffering until completion to be safe
 		}
-		c.Writer.Flush()
 	}
+}
+
+// Check if the text looks like it might be a tool call (to buffer vs stream)
+func looksLikeToolCall(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	// Be very aggressive - any JSON-like start should be buffered
+	// This prevents "{" and "{\"tool" from leaking through
+	return strings.HasPrefix(trimmed, "{") ||
+		   strings.HasPrefix(trimmed, `{"`) ||
+		   strings.Contains(trimmed, `"tool"`) ||
+		   strings.Contains(trimmed, `"server"`)
+}
+
+// Stream tool interpretation results
+func streamToolInterpretation(c *gin.Context, interpretation string) {
+	// Split interpretation into chunks for streaming effect
+	words := strings.Fields(interpretation)
+
+	c.SSEvent("delta", &ChatResponse{
+		Text:     "",
+		Delta:    "🔧 ", // Tool indicator
+		Finished: false,
+	})
+	c.Writer.Flush()
+
+	// Stream words with small delays to simulate natural typing
+	var accumulated strings.Builder
+	for i, word := range words {
+		accumulated.WriteString(word)
+		if i < len(words)-1 {
+			accumulated.WriteString(" ")
+		}
+
+		c.SSEvent("delta", &ChatResponse{
+			Text:     accumulated.String(),
+			Delta:    word + " ",
+			Finished: false,
+		})
+		c.Writer.Flush()
+
+		// Small delay for natural feel (optional)
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Send completion
+	c.SSEvent("done", &ChatResponse{
+		Text:     interpretation,
+		Finished: true,
+	})
+}
+
+// handleStreamingChatWithAgent handles streaming with the agent architecture
+func handleStreamingChatWithAgent(c *gin.Context, userQuery string) {
+	// Set headers for Server-Sent Events
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("Access-Control-Allow-Origin", "*")
+	c.Header("Access-Control-Allow-Headers", "Cache-Control")
+
+	// Run agent in background
+	go func() {
+		agentResponse, err := executeAgentRun(userQuery)
+		if err != nil {
+			log.Printf("Streaming agent run failed: %v", err)
+			c.SSEvent("error", &ChatResponse{
+				Error:    fmt.Sprintf("Agent run failed: %v", err),
+				Finished: true,
+			})
+			return
+		}
+
+		// Stream the response
+		streamToolInterpretation(c, agentResponse)
+	}()
 }
 
 // Destroy the LLM

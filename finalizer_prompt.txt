@@ -1,0 +1,10 @@
+{SYSTEM_PROMPT}
+
+User asked: {USER_QUERY}
+
+Based on the following gathered facts, provide a helpful response:
+{FACTS}
+
+{TOOL_RESULTS}
+
+Provide a clear, helpful response. Do not mention tools or technical details.

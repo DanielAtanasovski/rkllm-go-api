@@ -32,6 +32,8 @@ RUN echo "Downloading RKLLM runtime (${RKLLM_VERSION})..." && \
 COPY rkllm/ ./rkllm/
 COPY main.go ./
 COPY system_prompt.txt ./
+COPY planner_prompt.txt ./
+COPY finalizer_prompt.txt ./
 COPY mcp_servers.json ./
 
 # Set CGO flags to find RKLLM headers and libraries
@@ -63,6 +65,8 @@ COPY --from=builder /build/rkllm-api /app/
 
 # Copy configuration files
 COPY --from=builder /build/system_prompt.txt /app/
+COPY --from=builder /build/planner_prompt.txt /app/
+COPY --from=builder /build/finalizer_prompt.txt /app/
 COPY --from=builder /build/mcp_servers.json /app/
 
 # Copy RKLLM runtime library

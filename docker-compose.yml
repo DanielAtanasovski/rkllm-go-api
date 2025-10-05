@@ -1,6 +1,6 @@
 services:
   rkllm-api:
-    image: ghcr.io/danielatanasovski/rkllm-go-api:latest
+    build: .
     container_name: rkllm-api
 
     # NPU access requires privileged mode or specific device access
@@ -25,11 +25,11 @@ services:
       - PORT=8080
       - LD_LIBRARY_PATH=/usr/local/lib
       # Auto-initialize model on startup (optional)
-      - AUTO_INIT_MODEL=/models/DeepSeek-R1-Distill-Qwen-1.5B_W8A8_RK3588.rkllm
+      - AUTO_INIT_MODEL=/models/Qwen3-4B-rk3588-w8a8_g512-opt-1-hybrid-ratio-1.0.rkllm
       # Model parameters (optional)
-      - MAX_CONTEXT_LEN=1024
-      - MAX_NEW_TOKENS=512
-      - TEMPERATURE=0.8
+      - MAX_CONTEXT_LEN=4096
+      - MAX_NEW_TOKENS=2048
+      - TEMPERATURE=0.6
       # File paths for configuration
       - SYSTEM_PROMPT_PATH=/app/system_prompt.txt
       - MCP_SERVERS_PATH=/app/mcp_servers.json
