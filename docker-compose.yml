@@ -13,9 +13,13 @@ services:
     ports:
       - "8080:8080"
 
-    # Mount models directory
+    # Mount models directory and configuration files
     volumes:
       - /home/armbian/llm/models:/models:ro
+      # Mount system prompt (can be customized)
+      - ./system_prompt.txt:/app/system_prompt.txt:ro
+      # Mount MCP servers configuration
+      - ./mcp_servers.json:/app/mcp_servers.json:ro
       # Mount NPU firmware if needed
       # - /lib/firmware/rknpu:/lib/firmware/rknpu:ro
 
@@ -23,6 +27,15 @@ services:
     environment:
       - PORT=8080
       - LD_LIBRARY_PATH=/usr/local/lib
+      # Auto-initialize model on startup (optional)
+      - AUTO_INIT_MODEL=/models/Qwen3-4B-rk3588-w8a8_g512-opt-1-hybrid-ratio-1.0.rkllm
+      # Model parameters (optional)
+      - MAX_CONTEXT_LEN=1024
+      - MAX_NEW_TOKENS=512
+      - TEMPERATURE=0.8
+      # File paths for configuration
+      - SYSTEM_PROMPT_PATH=/app/system_prompt.txt
+      - MCP_SERVERS_PATH=/app/mcp_servers.json
 
     # Resource limits (optional, adjust based on your needs)
     deploy:

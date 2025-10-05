@@ -27,9 +27,11 @@ RUN echo "Downloading RKLLM runtime (${RKLLM_VERSION})..." && \
     mv ezrknn-llm-${RKLLM_VERSION}/rkllm-runtime ./rkllm-runtime && \
     rm -rf ezrknn-llm.zip ezrknn-llm-${RKLLM_VERSION}
 
-# Copy source code
+# Copy source code and configuration files
 COPY rkllm/ ./rkllm/
 COPY main.go ./
+COPY system_prompt.txt ./
+COPY mcp_servers.json ./
 
 # Set CGO flags to find RKLLM headers and libraries
 ENV CGO_ENABLED=1
@@ -57,6 +59,10 @@ WORKDIR /app
 
 # Copy the built binary from builder stage
 COPY --from=builder /build/rkllm-api /app/
+
+# Copy configuration files
+COPY --from=builder /build/system_prompt.txt /app/
+COPY --from=builder /build/mcp_servers.json /app/
 
 # Copy RKLLM runtime library
 COPY --from=builder /build/rkllm-runtime/Linux/librkllm_api/aarch64/librkllmrt.so /usr/local/lib/
