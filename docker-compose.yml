@@ -1,0 +1,51 @@
+services:
+  rkllm-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rkllm-go-api:latest
+    container_name: rkllm-api
+
+    # NPU access requires privileged mode or specific device access
+    privileged: true
+
+    # Port mapping
+    ports:
+      - "8080:8080"
+
+    # Mount models directory
+    volumes:
+      - /home/armbian/llm/models:/models:ro
+      # Mount NPU firmware if needed
+      # - /lib/firmware/rknpu:/lib/firmware/rknpu:ro
+
+    # Environment variables
+    environment:
+      - PORT=8080
+      - LD_LIBRARY_PATH=/usr/local/lib
+
+    # Resource limits (optional, adjust based on your needs)
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 5G
+
+    # Restart policy
+    restart: unless-stopped
+
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Health check (overrides Dockerfile HEALTHCHECK if needed)
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
