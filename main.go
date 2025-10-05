@@ -21,6 +21,10 @@ var (
 	isInitialized bool
 	currentResult string
 	resultMutex   sync.Mutex
+	// Streaming state
+	streamChannel chan *ChatResponse
+	streamMutex   sync.Mutex
+	isStreaming   bool
 )
 
 // InitRequest represents the request body for initializing the LLM
@@ -45,6 +49,7 @@ type ChatRequest struct {
 	Role           string `json:"role"`
 	EnableThinking bool   `json:"enable_thinking"`
 	KeepHistory    int    `json:"keep_history"`
+	Stream         bool   `json:"stream"`
 }
 
 // ChatResponse represents the response from a chat request
@@ -53,6 +58,8 @@ type ChatResponse struct {
 	TokenID        int32              `json:"token_id,omitempty"`
 	PerfStats      *rkllm.PerfStat    `json:"perf_stats,omitempty"`
 	Error          string             `json:"error,omitempty"`
+	Delta          string             `json:"delta,omitempty"`       // For streaming: incremental text
+	Finished       bool               `json:"finished,omitempty"`    // For streaming: indicates completion
 }
 
 // HealthResponse represents the health check response
@@ -62,7 +69,7 @@ type HealthResponse struct {
 	Running     bool   `json:"running"`
 }
 
-// Result callback that accumulates text
+// Result callback that accumulates text and handles streaming
 func resultCallback(result *rkllm.Result, state rkllm.CallState) int {
 	resultMutex.Lock()
 	defer resultMutex.Unlock()
@@ -71,6 +78,23 @@ func resultCallback(result *rkllm.Result, state rkllm.CallState) int {
 	case rkllm.CallStateNormal:
 		currentResult += result.Text
 		fmt.Print(result.Text) // Also print to console
+
+		// Send to stream if streaming is enabled
+		streamMutex.Lock()
+		if isStreaming && streamChannel != nil {
+			select {
+			case streamChannel <- &ChatResponse{
+				Text:     currentResult, // Full accumulated text so far
+				Delta:    result.Text,   // Incremental token
+				TokenID:  result.TokenID,
+				Finished: false,
+			}:
+			default:
+				// Channel is full or closed, continue
+			}
+		}
+		streamMutex.Unlock()
+
 	case rkllm.CallStateFinish:
 		fmt.Printf("\n[Perf] Prefill: %.2fms (%d tokens), Generate: %.2fms (%d tokens, %.2f tokens/s), Memory: %.2fMB\n",
 			result.Perf.PrefillTimeMs,
@@ -80,8 +104,44 @@ func resultCallback(result *rkllm.Result, state rkllm.CallState) int {
 			float32(result.Perf.GenerateTokens)*1000.0/result.Perf.GenerateTimeMs,
 			result.Perf.MemoryUsageMB,
 		)
+
+		// Send final response to stream if streaming is enabled
+		streamMutex.Lock()
+		if isStreaming && streamChannel != nil {
+			select {
+			case streamChannel <- &ChatResponse{
+				Text:      currentResult, // Complete final text
+				Finished:  true,
+				PerfStats: &result.Perf,
+			}:
+			default:
+				// Channel is full or closed, continue
+			}
+			close(streamChannel)
+			streamChannel = nil
+			isStreaming = false
+		}
+		streamMutex.Unlock()
+
 	case rkllm.CallStateError:
 		log.Println("Error in LLM callback")
+
+		// Send error to stream if streaming is enabled
+		streamMutex.Lock()
+		if isStreaming && streamChannel != nil {
+			select {
+			case streamChannel <- &ChatResponse{
+				Error:    "LLM callback error",
+				Finished: true,
+			}:
+			default:
+				// Channel is full or closed, continue
+			}
+			close(streamChannel)
+			streamChannel = nil
+			isStreaming = false
+		}
+		streamMutex.Unlock()
 	}
 
 	return 0
@@ -153,7 +213,7 @@ func initHandler(c *gin.Context) {
 	})
 }
 
-// Chat/completion endpoint
+// Chat/completion endpoint with streaming support
 func chatHandler(c *gin.Context) {
 	llmMutex.Lock()
 	if !isInitialized {
@@ -193,27 +253,88 @@ func chatHandler(c *gin.Context) {
 		KeepHistory: req.KeepHistory,
 	}
 
-	// Run inference
-	log.Printf("Running inference for prompt: %s\n", req.Prompt)
+	log.Printf("Running inference for prompt: %s (stream=%v)\n", req.Prompt, req.Stream)
 	startTime := time.Now()
 
-	err := llmHandle.Run(input, inferParam)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Inference failed: %v", err)})
-		return
+	if req.Stream {
+		// Handle streaming response
+		handleStreamingChat(c, input, inferParam)
+	} else {
+		// Handle non-streaming response (existing behavior)
+		err := llmHandle.Run(input, inferParam)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Inference failed: %v", err)})
+			return
+		}
+
+		elapsed := time.Since(startTime)
+		log.Printf("Inference completed in %v\n", elapsed)
+
+		// Get the accumulated result
+		resultMutex.Lock()
+		response := ChatResponse{
+			Text: currentResult,
+		}
+		resultMutex.Unlock()
+
+		c.JSON(http.StatusOK, response)
 	}
+}
 
-	elapsed := time.Since(startTime)
-	log.Printf("Inference completed in %v\n", elapsed)
+// handleStreamingChat handles Server-Sent Events streaming
+func handleStreamingChat(c *gin.Context, input rkllm.Input, inferParam rkllm.InferParam) {
+	// Set up streaming
+	streamMutex.Lock()
+	streamChannel = make(chan *ChatResponse, 10) // Buffered channel
+	isStreaming = true
+	streamMutex.Unlock()
 
-	// Get the accumulated result
-	resultMutex.Lock()
-	response := ChatResponse{
-		Text: currentResult,
+	// Set headers for Server-Sent Events
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("Access-Control-Allow-Origin", "*")
+	c.Header("Access-Control-Allow-Headers", "Cache-Control")
+
+	// Start inference in a goroutine
+	go func() {
+		err := llmHandle.Run(input, inferParam)
+		if err != nil {
+			log.Printf("Streaming inference failed: %v\n", err)
+			// Send error through stream
+			streamMutex.Lock()
+			if streamChannel != nil {
+				select {
+				case streamChannel <- &ChatResponse{
+					Error:    fmt.Sprintf("Inference failed: %v", err),
+					Finished: true,
+				}:
+				default:
+				}
+				close(streamChannel)
+				streamChannel = nil
+				isStreaming = false
+			}
+			streamMutex.Unlock()
+		}
+	}()
+
+	// Stream responses
+	for response := range streamChannel {
+		if response.Error != "" {
+			// Send error event
+			c.SSEvent("error", response)
+			break
+		} else if response.Finished {
+			// Send completion event with performance stats
+			c.SSEvent("done", response)
+			break
+		} else {
+			// Send delta event
+			c.SSEvent("delta", response)
+		}
+		c.Writer.Flush()
 	}
-	resultMutex.Unlock()
-
-	c.JSON(http.StatusOK, response)
 }
 
 // Destroy the LLM

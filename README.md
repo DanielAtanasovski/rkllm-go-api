@@ -44,10 +44,16 @@ curl -X POST http://localhost:8080/init \
     "max_new_tokens": 512
   }'
 
-# Send a chat request
+# Send a chat request (non-streaming)
 curl -X POST http://localhost:8080/chat \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "Hello, how are you?"}'
+  -d '{"prompt": "Hello, how are you?", "stream": false}'
+
+# Send a streaming chat request
+curl -X POST http://localhost:8080/chat \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Tell me a story", "stream": true}' \
+  --no-buffer
 ```
 
 ## API Endpoints
@@ -72,16 +78,34 @@ Initialize an RKLLM model.
 ```
 
 ### `POST /chat`
-Send a prompt and get a completion.
+Send a prompt and get a completion. Supports both regular and streaming responses.
 
 **Request Body:**
 ```json
 {
   "prompt": "What is AI?",
   "role": "user",
-  "keep_history": 0
+  "keep_history": 0,
+  "stream": false
 }
 ```
+
+**Streaming Mode:**
+Set `"stream": true` to receive Server-Sent Events (SSE) for real-time token streaming:
+
+```bash
+# Streaming request
+curl -X POST http://localhost:8080/chat \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Tell me a story", "stream": true}' \
+  --no-buffer
+```
+
+**Response Format:**
+- **Non-streaming:** Returns complete JSON response with full text
+- **Streaming:** Returns Server-Sent Events with incremental tokens:
+  - `data: {"delta": "token", "finished": false}` - Incremental text
+  - `data: {"finished": true, "perf_stats": {...}}` - Completion with stats
 
 ### `POST /destroy`
 Unload the model and free resources.

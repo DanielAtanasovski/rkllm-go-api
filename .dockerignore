@@ -1,0 +1,38 @@
+# Ignore build artifacts and runtime files
+rkllm-api
+*.log
+*.tmp
+
+# Ignore version control
+.git
+.gitignore
+
+# Ignore documentation and examples (not needed in container)
+README.md
+examples/
+docs/
+
+# Ignore Docker files themselves
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Ignore IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Ignore test files and coverage
+*_test.go
+coverage.*
+*.cover
+
+# Ignore temporary directories
+tmp/
+temp/

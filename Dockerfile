@@ -4,15 +4,20 @@
 FROM --platform=linux/arm64 golang:1.22-bookworm AS builder
 
 # Install required build tools
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     unzip \
     gcc \
     g++ \
     make \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 WORKDIR /build
+
+# Copy Go module files
+COPY go.mod go.sum ./
+RUN go mod download
 
 # Download RKLLM runtime from GitHub
 ARG RKLLM_VERSION=main
@@ -21,10 +26,6 @@ RUN echo "Downloading RKLLM runtime (${RKLLM_VERSION})..." && \
     unzip -q ezrknn-llm.zip && \
     mv ezrknn-llm-${RKLLM_VERSION}/rkllm-runtime ./rkllm-runtime && \
     rm -rf ezrknn-llm.zip ezrknn-llm-${RKLLM_VERSION}
-
-# Copy Go module files and download dependencies
-COPY go.mod go.sum ./
-RUN go mod download
 
 # Copy source code
 COPY rkllm/ ./rkllm/
@@ -45,10 +46,12 @@ RUN go build -o rkllm-api .
 FROM --platform=linux/arm64 debian:bookworm-slim
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+    curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 WORKDIR /app
 

@@ -2,7 +2,7 @@
 # Example bash client for RKLLM Go API
 
 API_BASE="http://localhost:8080"
-MODEL_PATH="/home/armbian/llm/models/Qwen3-4B-rk3588-w8a8_g512-opt-1-hybrid-ratio-1.0.rkllm"
+MODEL_PATH="/models/Qwen3-4B-rk3588-w8a8_g512-opt-1-hybrid-ratio-1.0.rkllm"
 
 echo "=== RKLLM Go API Bash Client Example ==="
 echo ""
@@ -32,15 +32,23 @@ echo ""
 # Give it a moment to fully initialize
 sleep 1
 
-# Send chat request
-echo "3. Sending chat request..."
+# Send regular chat request (non-streaming)
+echo "3. Sending regular chat request..."
 curl -s -X POST "$API_BASE/chat" \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "How many r`s in the word strawberry?", "role": "user"}' | jq . || curl -s -X POST "$API_BASE/chat" -H "Content-Type: application/json" -d '{"prompt": "What is the capital of France?"}'
+  -d '{"prompt": "How many r'\''s in the word strawberry?", "role": "user", "stream": false}' | jq . || curl -s -X POST "$API_BASE/chat" -H "Content-Type: application/json" -d '{"prompt": "What is the capital of France?"}'
+echo ""
+
+# Send streaming chat request
+echo "4. Sending streaming chat request..."
+curl -s -X POST "$API_BASE/chat" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Tell me a short story about a robot.", "role": "user", "stream": true}' \
+  --no-buffer
 echo ""
 
 # Destroy model
-echo "4. Destroying model..."
+echo "5. Destroying model..."
 curl -s -X POST "$API_BASE/destroy" | jq . || curl -s -X POST "$API_BASE/destroy"
 echo ""
 
