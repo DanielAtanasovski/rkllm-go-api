@@ -1,7 +1,7 @@
 # Multi-stage Dockerfile for RKLLM Go API
 # Stage 1: Builder - downloads RKLLM runtime and builds the Go application
 
-FROM golang:1.22-bookworm AS builder
+FROM golang:1.25-bookworm AS builder
 
 # Install required build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
